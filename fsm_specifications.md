@@ -2,6 +2,7 @@
 ---
 config:
   theme: default
+  layout: adaptive
 ---
 stateDiagram-v2
     [*] --> INIT
