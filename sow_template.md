@@ -32,37 +32,235 @@
 
 ### 2.1 Message Transport & Serialization Format
 - **Transport Protocol:** TCP
-- **Serialization Format:** [JSON / Fixed-Header Binary / Delimited Text]
-- **Framing Mechanism:** [e.g., Newline-delimited (`\n`) JSON payloads OR 4-byte big-endian length prefix]
+- **Serialization Format:** Delimited Text 
+- **Framing Mechanism:** Text Delimited Protocol
 
+- **Framing Rule:** 
+1) Message fields are separated by the '|' character
+2) Newlines '(\n)' determine the end of the message. 
+3) Subfields within messages use the ',' character. 
+4) If message happens to be split across multiple recv() calls, I store the incomplete bytes and once \n is recieved then the message is considered complete.
+5) If one recv() contains several messages, I split the buffer on \n. The complete messages are processed accordingly and the remaining bytes stay in buffer for future.
+
+- **Wire Stream Example:** CONNECT|Player_1|1727000000\nMOVE|Player_1|0,2|1727000005\nSTATE_UPDATE|SERVER|-,-,X,-,-,-,-,-,-|Player_2|1727000006\n
+ 
+- **Field Grammar Example:**  Format: CONNECT|<PLAYER_ID>|<TIMESTAMP>\n
+                              Example: CONNECT|Player_1|1727000005\n
+                              Fields:
+                                - MSG_TYPE   (string)  : "CONNECT"
+                                - PLAYER_ID  (string)  : Alphanumeric alias of connecting player (e.g. "Player_1")
+                                - TIMESTAMP  (integer) : Unix epoch timestamp in seconds
+
+                              Format: MOVE|<PLAYER_ID>|<ROW>,<COL>|<TIMESTAMP>\n
+                              Example: MOVE|Player_1|0,2|1727000005\n
+                              Fields:
+                                - MSG_TYPE   (string)  : "MOVE"
+                                - PLAYER_ID  (string)  : Alphanumeric alias of active player (e.g. "Player_1")
+                                - PAYLOAD    (integers): <row>,<col> zero-indexed grid coordinates (e.g. "0,2")
+                                - TIMESTAMP  (integer) : Unix epoch timestamp in seconds
+
+- **TCP Stream Packet Framing & Boundary Handling:**
+
+```python
+# Handling Fragmentation
+def fragmentation(buffer, data):
+    return buffer + data
+
+# Handling Coalescing
+def coalescing(buffer):
+    parts = buffer.split(b"\n")
+    messages = parts[:-1]
+    buffer = parts[-1]
+    return messages, buffer
+
+# Detecting TCP Infinite Loops + Handling Disconnects
+buffer = b""
+while True:
+    try:
+        data = sock.recv(1024)
+        # Handle infinite loop
+        if not data:
+            logger.info("Remote peer disconnected (EOF received).")
+            sock.close()
+            trigger_state_transition("CLIENT_DISCONNECTED")
+            break
+        buffer = fragmentation(buffer, data)
+        messages, buffer = coalescing(buffer)
+        for msg in messages:
+            handle_message(msg)
+    except (ConnectionResetError, BrokenPipeError,
+            ConnectionAbortedError, TimeoutError) as e:
+        logger.warning(f"Connection lost abruptly: {e}")
+        trigger_state_transition("CLIENT_DISCONNECTED")
+        break
+```
+  
 ### 2.2 Message Schema Definitions
 
 #### Message Types:
 1. `CONNECT` (Client -> Server): Request to join the game room.
 2. `LOBBY_WAIT` (Server -> Client): Notification that server is waiting for Player 2.
 3. `GAME_START` (Server -> Clients): Game initiated, assigns roles (e.g. Player X vs Player O).
-4. `MOVE` (Client -> Server): Player action (e.g., cell coordinates or answer choice).
+4. `MOVE` (Client -> Server): Player action (Current player selects a coordinate on grid to mark it).
 5. `STATE_UPDATE` (Server -> Clients): Broadcast current game board / state and active player turn.
-6. `GAME_OVER` (Server -> Clients): Victory / Draw notification with final scores.
+6. `GAME_OVER` (Server -> Clients): Victory / Draw notification with WIN/DRAW/FORFEIT.
 7. `ERROR` (Server -> Client): Invalid move or malformed packet error.
+8. `DISCONNECT` (Client -> Server): Player disconnects from the game. Results in forfeit win for opponent.
 
-#### Example JSON Protocol Schema:
-```json
-{
-  "msg_type": "MOVE",
-  "player_id": "Player_1",
-  "payload": {
-    "row": 0,
-    "col": 2
-  },
-  "timestamp": 1727000000
-}
+#### Example Text Delimited Protocol Schema:
+```
+  CONNECT|<PLAYER_ID>|<TIMESTAMP>\n
+    Example: CONNECT|Player_1|1727000005\n
+    Fields:
+      - MSG_TYPE   (string)  : "CONNECT"
+      - PLAYER_ID  (string)  : Alphanumeric alias of connecting player (e.g. "Player_1")
+      - TIMESTAMP  (integer) : Unix epoch timestamp in seconds
+
+  MOVE|<PLAYER_ID>|<ROW>,<COL>|<TIMESTAMP>\n
+    Example: MOVE|Player_1|0,2|1727000005\n
+    Fields:
+      - MSG_TYPE   (string)  : "MOVE"
+      - PLAYER_ID  (string)  : Alphanumeric alias of active player (e.g. "Player_1")
+      - PAYLOAD    (integers): <row>,<col> zero-indexed grid coordinates (e.g. "0,2")
+      - TIMESTAMP  (integer) : Unix epoch timestamp in seconds
+    
+  LOBBY_WAIT|SERVER|<STATUS>|<TIMESTAMP>\n
+    Example: LOBBY_WAIT|SERVER|WAITING_FOR_PLAYER_2|1727000006\n
+    Fields:
+      - MSG_TYPE  (string)  : "LOBBY_WAIT"
+      - SOURCE    (string)  : "SERVER"
+      - STATUS    (string)  : Current lobby status (e.g. "WAITING_FOR_PLAYER_2")
+      - TIMESTAMP (integer) : Unix epoch timestamp in seconds
+
+  GAME_START|SERVER|<PLAYER_1>,<SYMBOL>|<PLAYER_2>,<SYMBOL>|<TIMESTAMP>\n
+    Example: GAME_START|SERVER|Player_1,X|Player_2,O|1727000007\n
+    Fields:
+      - MSG_TYPE          (string)  : "GAME_START"
+      - SOURCE            (string)  : "SERVER"
+      - PLAYER_1,SYMBOL   (string)  : Player 1 identifier and assigned symbol
+      - PLAYER_2,SYMBOL   (string)  : Player 2 identifier and assigned symbol
+      - TIMESTAMP         (integer) : Unix epoch timestamp in seconds
+
+  STATE_UPDATE|SERVER|<BOARD>|<ACTIVE_PLAYER>|<TIMESTAMP>\n
+    Example: STATE_UPDATE|SERVER|X,-,-,-,O,-,-,-,-|Player_2|1727000011\n
+    Fields:
+      - MSG_TYPE       (string)  : "STATE_UPDATE"
+      - SOURCE         (string)  : "SERVER"
+      - BOARD          (string)  : Nine comma-separated cells representing the current board
+      - ACTIVE_PLAYER  (string)  : Player whose turn is next
+      - TIMESTAMP      (integer) : Unix epoch timestamp in seconds
+
+  GAME_OVER|SERVER|<RESULT>|<PLAYER_ID>|<TIMESTAMP>\n
+    Example: GAME_OVER|SERVER|WIN|Player_1|1727000015\n
+    Fields:
+      - MSG_TYPE   (string)  : "GAME_OVER"
+      - SOURCE     (string)  : "SERVER"
+      - RESULT     (string)  : Game result: "WIN", "DRAW", or "FORFEIT"
+      - PLAYER_ID  (string)  : Winning player, or "-" if DRAW
+      - TIMESTAMP  (integer) : Unix epoch timestamp in seconds
+
+  ERROR|SERVER|<ERROR_CODE>|<TIMESTAMP>\n
+    Example: ERROR|SERVER|OUT_OF_TURN|1727000012\n
+    Fields:
+      - MSG_TYPE    (string)  : "ERROR"
+      - SOURCE      (string)  : "SERVER"
+      - ERROR_CODE  (string)  : MALFORMED_MESSAGE | WRONG_STATE | OUT_OF_TURN | INVALID_COORDS | CELL_OCCUPIED
+      - TIMESTAMP   (integer) : Unix epoch timestamp in seconds
+
+  DISCONNECT|<PLAYER_ID>|<TIMESTAMP>\n
+    Example: DISCONNECT|Player_1|1727000020\n
+    Fields:
+      - MSG_TYPE   (string)  : "DISCONNECT"
+      - PLAYER_ID  (string)  : Alphanumeric alias of disconnected player
+      - TIMESTAMP  (integer) : Unix epoch timestamp in seconds
 ```
 
----
-
 ### 2.3 Game State Machine (FSM) Design (Sprint 1 Deliverable)
-- **State Transitions:** Detail state flow: `INIT` -> `WAITING_FOR_PLAYERS` -> `PLAYER_TURN` -> `EVALUATE_MOVE` -> `CHECK_WIN_DRAW` -> `GAME_OVER` -> `CLEANUP`.
+```mermaid
+---
+config:
+  theme: default
+---
+stateDiagram-v2
+    [*] --> INIT
+    INIT --> WAITING_FOR_PLAYERS: Server Started & Listening
+    WAITING_FOR_PLAYERS --> GAME_START: 2 Clients Connected
+    GAME_START --> PLAYER_TURN: Initialize Board, Assign Player 1 = X and Player 2 = O, Player 1 moves first
+    PLAYER_TURN --> EVALUATE_MOVE: Active Player Sends MOVE
+    PLAYER_TURN --> PLAYER_TURN: Out-of-turn or Malformed Message (Send ERROR)
+    PLAYER_TURN --> GAME_OVER: CLIENT_DISCONNECTED (DISCONNECT msg, EOF, or Socket Error) Send GAME_OVER FORFEIT to opponent
+    EVALUATE_MOVE --> PLAYER_TURN: Valid Move (Update board, swap turn, send STATE_UPDATE)
+    EVALUATE_MOVE --> PLAYER_TURN: Invalid Move (Send ERROR to Client)
+    EVALUATE_MOVE --> GAME_OVER: Victory or Draw Detected (Send STATE_UPDATE and GAME_OVER)
+    GAME_OVER --> CLEANUP: Broadcast Final Results
+    CLEANUP --> WAITING_FOR_PLAYERS: Reset State
+```
+
+- INIT: Initialization and server starts
+- WAITING_FOR_PLAYERS: Waits until 2 players connect. 
+- `GAME_START`: Initialize Board, Assign Player 1 = X and Player 2 = O, Player 1 moves first
+- `PLAYER_TURN`: Waits for `MOVE` from the active player. Out-of-turn or malformed messages get `ERROR`.
+- `EVALUATE_MOVE`: Validates the move, updates the board, checks for win or draw.
+- `GAME_OVER`: Sends `GAME_OVER` (WIN, DRAW, or FORFEIT).
+- `CLEANUP`: Closes sockets and reset state.
+
+### Valid Moves
+If invalid moves checks do not fail, then:
+- Player's symbol (X or O) is placed in the cell.
+- Checks for a win or draw.
+- If there is no result, it swaps the active player, sends `STATE_UPDATE` to both clients, and stays in `PLAYER_TURN`.
+- If there is a win or draw, it sends `STATE_UPDATE`, then `GAME_OVER`, and moves to `GAME_OVER`.
+
+### Invalid Moves
+1. The line has invalid syntax: `MALFORMED_MESSAGE`. Example: `MOVE|Player_1|abc`.
+2. The server is not in `PLAYER_TURN`: `WRONG_STATE`. Example: a `MOVE` sent before `GAME_START`.
+3. It is not the sender's turn: `OUT_OF_TURN`. Example: Player 2 moves on Player 1's turn.
+4. The row or column is outside the grid: `INVALID_COORDS`. Example: `MOVE|Player_1|3,1|1727000008`.
+5. The cell is already filled: `CELL_OCCUPIED`. Example: moving on a cell that holds `X`.
+
+DISCONNECTIONS: Triggers CLIENT_DISCONNECTED
+
+
+### 2.4 Connection Termination & Socket Lifecycle Management
+
+1. Handling Disconnet Gracefully: the server receives `DISCONNECT|<PLAYER_ID>|<TIMESTAMP>\n`. Server sends `GAME_OVER|SERVER|FORFEIT|<surviving player>|<TIMESTAMP>\n` to opponent who wins by forfeit if game is in session.
+2. Transport Layer Teardown (TCP FIN): `recv()` returns `b""`. Handled with trigger_state_transition("CLIENT_DISCONNECTED")
+3. Abrupt Termination (TCP RST, network drop, timeout): `recv()` or `send()` raises an exception. Handled with trigger_state_transition("CLIENT_DISCONNECTED")
+4. Socket Rule and Infinite Loop: when the peer closes cleanly, `recv()` does not raise an exception, it returns `b""`. Infinite Looping Handled with:
+
+        ```python
+        # Handle Socket Rule and Infinite Loop
+        if not data:
+            logger.info("Remote peer disconnected (EOF received).")
+            sock.close()
+            trigger_state_transition("CLIENT_DISCONNECTED")
+            break
+        ```
+5. ConnectionRestError, BrokenPipeError, TimeoutError: Handled below
+
+```python
+buffer = b""
+while True:
+    try:
+        data = sock.recv(1024)
+        # Handle Socket Rule and Infinite Loop
+        if not data:
+            logger.info("Remote peer disconnected (EOF received).")
+            sock.close()
+            trigger_state_transition("CLIENT_DISCONNECTED")
+            break
+        buffer = fragmentation(buffer, data)
+        messages, buffer = coalescing(buffer)
+        for msg in messages:
+            handle_message(msg)
+    except (ConnectionResetError, BrokenPipeError,
+            ConnectionAbortedError, TimeoutError) as e:
+        logger.warning(f"Connection lost abruptly: {e}")
+        trigger_state_transition("CLIENT_DISCONNECTED")
+        break
+
+```
+
 
 ---
 
